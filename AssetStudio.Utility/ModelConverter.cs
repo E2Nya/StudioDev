@@ -23,6 +23,7 @@ namespace AssetStudio
         private Dictionary<Texture2D, string> textureNameDictionary = new Dictionary<Texture2D, string>();
         private Dictionary<Transform, ImportedFrame> transformDictionary = new Dictionary<Transform, ImportedFrame>();
         Dictionary<uint, string> morphChannelNames = new Dictionary<uint, string>();
+        private HashSet<long> convertedSpecialMeshOwners = new HashSet<long>();
 
         public ModelConverter(GameObject m_GameObject, Options options, AnimationClip[] animationList = null)
         {
@@ -176,6 +177,7 @@ namespace AssetStudio
         }
         public class VLSkinningRenderer
         {
+            public PPtr<Transform> RootBone { get; set; }
             public List<PPtr<Transform>> Bones { get; set; }
             public List<Matrix4x4> Bindposes { get; set; }
             public AABB LocalBounds { get; set; }
@@ -192,9 +194,94 @@ namespace AssetStudio
                 blendShapeWeightsList = new List<float>();
             }
         }
+        private static void DecodePackedWeight(uint packed, out int boneIndex, out float weight)
+        {
+            boneIndex = (int)(packed & 0xFFFF);
+            ushort w = (ushort)(packed >> 16);
+            weight = w / 65535f;
+        }
+
+        private static BoneWeights4 DecodeVertexWeights(uint a, uint b, uint c, uint d)
+        {
+            var bw = new BoneWeights4
+            {
+                boneIndex = new int[4],
+                weight = new float[4]
+            };
+
+            DecodePackedWeight(a, out bw.boneIndex[0], out bw.weight[0]);
+            DecodePackedWeight(b, out bw.boneIndex[1], out bw.weight[1]);
+            DecodePackedWeight(c, out bw.boneIndex[2], out bw.weight[2]);
+            DecodePackedWeight(d, out bw.boneIndex[3], out bw.weight[3]);
+
+            float sum = bw.weight[0] + bw.weight[1] + bw.weight[2] + bw.weight[3];
+            if (sum > 0f)
+            {
+                bw.weight[0] /= sum;
+                bw.weight[1] /= sum;
+                bw.weight[2] /= sum;
+                bw.weight[3] /= sum;
+            }
+
+            return bw;
+        }
+
+        private static bool HasComponent(GameObject m_GameObject, string componentName)
+        {
+            return m_GameObject?.m_Components?.Find(x => x.Name == componentName) != null;
+        }
+
+        private bool ConvertDecalProjectorTargets(Transform decalTransform)
+        {
+            decalTransform.m_GameObject.TryGet(out var decalGameObject);
+            if (!HasComponent(decalGameObject, "DecalProjector"))
+            {
+                return false;
+            }
+
+            var current = decalTransform;
+            while (current != null)
+            {
+                current.m_GameObject.TryGet(out var currentGameObject);
+                if (currentGameObject != null)
+                {
+                    if (currentGameObject.m_SkinnedMeshRenderer != null)
+                    {
+                        if (convertedSpecialMeshOwners.Add(currentGameObject.m_PathID))
+                        {
+                            ConvertMeshRenderer(currentGameObject.m_SkinnedMeshRenderer);
+                        }
+                        return true;
+                    }
+
+                    if (currentGameObject.m_MeshRenderer != null)
+                    {
+                        if (convertedSpecialMeshOwners.Add(currentGameObject.m_PathID))
+                        {
+                            ConvertMeshRenderer(currentGameObject.m_MeshRenderer);
+                        }
+                        return true;
+                    }
+                }
+
+                if (!current.m_Father.TryGet(out current))
+                {
+                    current = null;
+                }
+            }
+
+            return false;
+        }
+
         private void ConvertMeshRenderer(Transform m_Transform)
         {
             m_Transform.m_GameObject.TryGet(out var m_GameObject);
+
+            if (ConvertDecalProjectorTargets(m_Transform))
+            {
+                return;
+            }
+
             if (m_GameObject.m_Components.Find(x => x.Name == "VLActorFaceModel") != null || m_GameObject.Name == "VLSkinningRenderer")
             {
                 var vlskinningRenderer = new VLSkinningRenderer();
@@ -249,7 +336,15 @@ namespace AssetStudio
                             }
                             vlskinningRenderer.Bindposes = bindposesList;
                         }
-                        var tmp1 = obj["localBounds"] as OrderedDictionary;
+                        var tmp1 = obj["rootBone"] as OrderedDictionary;
+                        if (tmp1 != null)
+                        {
+                            var fileID = Convert.ToInt32(tmp1["m_FileID"] ?? 0);
+                            var pathID = Convert.ToInt64(tmp1["m_PathID"] ?? 0);
+                            vlskinningRenderer.RootBone = new PPtr<Transform>(fileID, pathID, m_GameObject.assetsFile);
+                        }
+
+                        tmp1 = obj["localBounds"] as OrderedDictionary;
                         if (tmp1 != null)
                         {
                             AABB localBounds = null;
@@ -371,10 +466,8 @@ namespace AssetStudio
 
                     if (m_GameObject.Name == "VLSkinningRenderer")
                     {
-                        if (ptrMesh != null)
-                        {
-                            m_GameObject.m_MeshFilter.m_Mesh = ptrMesh;
-                        }
+                        // B案: child VLSkinningRenderer は export owner にしない
+                        return;
                     }
                     else
                     {
@@ -383,6 +476,7 @@ namespace AssetStudio
                         vlskin.reader.Position = origin;
                         vlRenderer.m_AABB = vlskinningRenderer.LocalBounds;
                         vlRenderer.m_Bones = vlskinningRenderer.Bones;
+                        vlRenderer.m_RootBone = vlskinningRenderer.RootBone;
                         vlRenderer.m_BlendShapeWeights = vlskinningRenderer.blendShapeWeightsList.ToArray();
                         vlRenderer.m_Mesh = vlskin.m_MeshFilter.m_Mesh;
                         m_GameObject.m_SkinnedMeshRenderer = vlRenderer;
@@ -391,6 +485,36 @@ namespace AssetStudio
                         vlskin.m_MeshFilter.m_Mesh = ptrMesh;
                         var mesh = GetMesh(m_GameObject.m_SkinnedMeshRenderer);
                         mesh.m_BindPose = vlskinningRenderer.Bindposes.ToArray();
+
+                        if (vlskinningRenderer.BoneWeightAndIndices.Count > 0)
+                        {
+                            var skin = new List<BoneWeights4>((int)mesh.m_VertexCount);
+                            var data = vlskinningRenderer.BoneWeightAndIndices;
+                            int vertexCountFromWeights = data.Count / 4;
+                            int vertexCount = Math.Min((int)mesh.m_VertexCount, vertexCountFromWeights);
+
+                            for (int v = 0; v < vertexCount; v++)
+                            {
+                                skin.Add(DecodeVertexWeights(
+                                    data[v * 4 + 0],
+                                    data[v * 4 + 1],
+                                    data[v * 4 + 2],
+                                    data[v * 4 + 3]
+                                ));
+                            }
+
+                            while (skin.Count < mesh.m_VertexCount)
+                            {
+                                skin.Add(new BoneWeights4
+                                {
+                                    boneIndex = new int[4],
+                                    weight = new float[4]
+                                });
+                            }
+
+                            mesh.m_Skin = skin;
+                        }
+
                         m_GameObject.m_MeshRenderer = vlskin.m_MeshRenderer;
                         m_GameObject.m_MeshFilter = vlskin.m_MeshFilter;
                         var meshBlendShapeList = new List<MeshBlendShape>();
@@ -444,12 +568,16 @@ namespace AssetStudio
                 }
 
             }
-            if (m_GameObject.m_MeshRenderer != null)
+            var isVLActorFaceModel = m_GameObject.m_Components.Find(x => x.Name == "VLActorFaceModel") != null;
+            var isVLSkinningRenderer = m_GameObject.Name == "VLSkinningRenderer";
+            var isDecalProjector = HasComponent(m_GameObject, "DecalProjector");
+
+            if (m_GameObject.m_MeshRenderer != null && !isVLActorFaceModel && !isVLSkinningRenderer && !isDecalProjector)
             {
                 ConvertMeshRenderer(m_GameObject.m_MeshRenderer);
             }
 
-            if (m_GameObject.m_SkinnedMeshRenderer != null)
+            if (m_GameObject.m_SkinnedMeshRenderer != null && !isDecalProjector)
             {
                 ConvertMeshRenderer(m_GameObject.m_SkinnedMeshRenderer);
             }
